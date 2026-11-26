@@ -1,12 +1,12 @@
-"""Load and clean Epoch AI tables for the dashboard.
+"""Load Epoch AI tables for the dashboard.
 
-Raw CSVs stay untouched. Speculative campuses are dropped, organization
-names are aligned, and chip types are grouped into a few families.
+Yuehua Zhuang. Raw CSVs stay untouched. Speculative campuses are dropped,
+organization names are aligned, and chip types are grouped into a few families.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -14,7 +14,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "epoch"
-AS_OF = date(2026, 11, 4)
+AS_OF = date(2026, 11, 23)
 
 FOCUS_OWNERS = [
     "Google",
@@ -28,6 +28,7 @@ FOCUS_OWNERS = [
 LABS = ["OpenAI", "Anthropic"]
 REVENUE_COMPANIES = ["OpenAI", "Anthropic", "xAI"]
 
+# One hue per company, from the Okabe–Ito and Tol categorical palettes.
 COLORS = {
     "Google": "#E69F00",
     "Meta": "#0072B2",
@@ -39,7 +40,7 @@ COLORS = {
     "OpenAI": "#44AA99",
     "Anthropic": "#882255",
     "Other": "#B9BDC4",
-    "Unattributed": "#DCDFE3",
+    "Unknown": "#DCDFE3",
 }
 
 CHIP_PATTERNS = {
@@ -50,11 +51,8 @@ CHIP_PATTERNS = {
     "Unspecified": "-",
 }
 CHIPS = list(CHIP_PATTERNS)
-ROLES = ["owner", "user"]
-STATUSES = ["all", "operating", "planned"]
 
 MONTHS = pd.date_range("2018-01-01", "2030-01-01", freq="MS")
-QUARTERS = pd.date_range("2018-01-01", "2030-01-01", freq="QS")
 
 _ALIASES = {
     "google": "Google",
@@ -121,6 +119,7 @@ def _to_number(series: pd.Series) -> pd.Series:
 
 
 def _prepare_campuses(timeline: pd.DataFrame) -> pd.DataFrame:
+    """Drop a campus whose listed owner is marked speculative."""
     raw = pd.read_csv(DATA_DIR / "data_centers.csv")
     rows = []
     for record in raw.to_dict(orient="records"):
@@ -153,20 +152,32 @@ def _prepare_campuses(timeline: pd.DataFrame) -> pd.DataFrame:
     campuses["h100e"] = _to_number(campuses["h100e"])
     campuses["snapshot_power_mw"] = _to_number(campuses["snapshot_power_mw"])
     campuses["cost_b"] = _to_number(campuses["cost_b"]).fillna(0)
-    campuses["color"] = campuses["owner"].where(campuses["owner"].isin(COLORS), "Other")
-    campuses["color"] = campuses["color"].where(campuses["owner"].isin(FOCUS_OWNERS), "Other")
+    campuses["owner_label"] = campuses["owner"].where(campuses["owner"].astype(str).str.len() > 0, "Unknown")
+    campuses["users_label"] = campuses["users"].map(lambda users: ", ".join(users) if users else "Unknown")
+    campuses["chips_label"] = campuses["chip_raw"].map(_chip_label)
 
-    as_of = pd.Timestamp(AS_OF)
-    history = timeline.loc[timeline["date"] <= as_of].sort_values("date")
-    latest = history.groupby("campus", as_index=False).tail(1)
-    power = latest.set_index("campus")["it_power_mw"]
-    campuses["it_power_mw"] = campuses["name"].map(power)
-    campuses["it_power_mw"] = campuses["it_power_mw"].where(
-        campuses["it_power_mw"] > 0, campuses["snapshot_power_mw"]
-    )
+    history = timeline.loc[timeline["date"] <= pd.Timestamp(AS_OF)]
     powered_now = history.loc[history["it_power_mw"] > 0, "campus"]
     campuses["status"] = campuses["name"].isin(set(powered_now)).map({True: "operating", False: "planned"})
     return campuses
+
+
+METRIC_COLUMNS = (
+    "buildings",
+    "it_power_mw",
+    "power_mw",
+    "h100e",
+    "performance",
+    "cost_b",
+    "compute_cost_b",
+    "construction_cost_b",
+    "operating_cost_b",
+)
+
+
+def _chip_label(text) -> str:
+    parts = [part.strip() for part in str(text or "").split(",") if part.strip() and part.strip().lower() != "nan"]
+    return ", ".join(parts) if parts else "Unknown"
 
 
 def _prepare_timelines() -> pd.DataFrame:
@@ -175,12 +186,52 @@ def _prepare_timelines() -> pd.DataFrame:
         {
             "campus": raw["Data center"],
             "date": pd.to_datetime(raw["Date"], errors="coerce"),
-            "it_power_mw": _to_number(raw["IT power (MW)"]),
-            "h100e": _to_number(raw["H100 equivalents"]).fillna(0),
             "status": raw["Construction status"].fillna("").astype(str),
+            "buildings": _to_number(raw["Buildings operational"]),
+            "it_power_mw": _to_number(raw["IT power (MW)"]),
+            "power_mw": _to_number(raw["Power (MW)"]),
+            "h100e": _to_number(raw["H100 equivalents"]),
+            "performance": _to_number(raw["Performance (8-bit OP/s)"]),
+            "cost_b": _to_number(raw["Total capital cost (2025 USD billions)"]),
+            "compute_cost_b": _to_number(raw["Compute cost (2025 USD billions)"]),
+            "construction_cost_b": _to_number(raw["Construction cost (2025 USD billions)"]),
+            "operating_cost_b": _to_number(raw["Annual operating cost (2025 USD billions)"]),
         }
     )
-    return timelines.dropna(subset=["date"]).sort_values(["campus", "date"])
+    timelines = timelines.dropna(subset=["date"]).sort_values(["campus", "date"])
+    return _repair_timeline(timelines)
+
+
+def _repair_timeline(frame: pd.DataFrame) -> pd.DataFrame:
+    """Fill compute holes that are zero-power or unchanged from the previous row.
+
+    A missing building count is left empty. The 2028 Stargate Milam row says the
+    site is finished but never gives a building count.
+    """
+    frame = frame.copy()
+    for indexes in frame.groupby("campus", sort=False).groups.values():
+        previous_power = None
+        previous_h100 = None
+        previous_performance = None
+        for index in indexes:
+            power = frame.at[index, "it_power_mw"]
+            if pd.isna(frame.at[index, "h100e"]):
+                if pd.notna(power) and power == 0:
+                    frame.at[index, "h100e"] = 0.0
+                    frame.at[index, "performance"] = 0.0
+                elif (
+                    previous_h100 is not None
+                    and pd.notna(power)
+                    and power == previous_power
+                ):
+                    frame.at[index, "h100e"] = previous_h100
+                    frame.at[index, "performance"] = previous_performance
+            if pd.notna(frame.at[index, "h100e"]):
+                previous_h100 = float(frame.at[index, "h100e"])
+                performance = frame.at[index, "performance"]
+                previous_performance = None if pd.isna(performance) else float(performance)
+            previous_power = None if pd.isna(power) else float(power)
+    return frame
 
 
 def _org_list(value: str) -> list[str]:
@@ -194,45 +245,68 @@ def _org_list(value: str) -> list[str]:
     return seen
 
 
+SCORE_FIELDS = ("compute", "params", "data")
+SCORE_LABELS = {"compute": "compute", "params": "parameters", "data": "data"}
+MODEL_TIERS = ("all", "notable", "frontier")
+RAW_METRICS = SCORE_FIELDS
+STATS = ("max", "median")
+# Oracle and CoreWeave own campuses, and neither has models in this file.
+MODEL_FOCUS = [name for name in FOCUS_OWNERS + LABS if name not in {"Oracle", "CoreWeave"}]
+
+
 def _prepare_models() -> pd.DataFrame:
-    raw = pd.read_csv(DATA_DIR / "notable_ai_models.csv")
+    raw = pd.read_csv(DATA_DIR / "all_ai_models.csv")
+    criteria = raw["Notability criteria"]
+    criteria_text = criteria.fillna("").astype(str).str.strip()
+    frontier_flag = raw["Frontier model"]
+    if frontier_flag.dtype == bool:
+        is_frontier = frontier_flag.fillna(False)
+    else:
+        is_frontier = frontier_flag.astype(str).str.strip().str.lower().eq("true")
     models = pd.DataFrame(
         {
-            "model": raw["Model"],
+            "model": raw["Model"].fillna("").astype(str),
             "orgs": raw["Organization"].map(_org_list),
             "date": pd.to_datetime(raw["Publication date"], errors="coerce"),
             "compute": _to_number(raw["Training compute (FLOP)"]),
             "params": _to_number(raw["Parameters"]),
-            "domain": raw["Domain"].fillna("").astype(str),
+            "data": _to_number(raw["Training dataset size (total)"]),
+            "notable": criteria_text.ne("") & criteria_text.str.lower().ne("nan"),
+            "frontier": is_frontier.fillna(False).astype(bool),
         }
     )
-    models = models.dropna(subset=["date"])
-    models["has_compute"] = models["compute"] > 0
-    models["primary"] = models["orgs"].map(_primary_org)
-    return models
+    models = models.dropna(subset=["date"]).reset_index(drop=True)
+    models["point_org"] = models["orgs"].map(_point_org)
+    return _attach_scores(models)
 
 
-def _primary_org(orgs: list[str]) -> str:
+def _point_org(orgs: list[str]) -> str:
     for name in orgs:
-        if name in FOCUS_OWNERS or name in LABS:
+        if name in MODEL_FOCUS:
             return name
-    return "Other"
+    return orgs[0] if orgs else "Other"
 
 
-def _prepare_revenue() -> pd.DataFrame:
-    raw = pd.read_csv(DATA_DIR / "ai_companies_revenue_reports.csv")
-    revenue = pd.DataFrame(
-        {
-            "company": raw["Company"].map(canonicalize),
-            "date": pd.to_datetime(raw["Date"], errors="coerce"),
-            "revenue_usd": _to_number(raw["Annualized revenue (USD)"]),
-            "revenue_type": raw["Annualized revenue type"].fillna("").astype(str),
-        }
-    )
-    revenue = revenue.dropna(subset=["date", "revenue_usd"])
-    revenue = revenue.loc[revenue["company"].isin(REVENUE_COMPANIES)]
-    revenue = revenue.sort_values("date").drop_duplicates(["company", "date"], keep="last")
-    return revenue
+def _attach_scores(models: pd.DataFrame) -> pd.DataFrame:
+    """Percentile each metric inside a tier, across all years, then average the ones present."""
+    tiers = {
+        "all": pd.Series(True, index=models.index),
+        "notable": models["notable"],
+        "frontier": models["frontier"],
+    }
+    for tier, mask in tiers.items():
+        percentiles = pd.DataFrame(index=models.index)
+        for field in SCORE_FIELDS:
+            values = models[field].where(mask & (models[field] > 0))
+            percentiles[field] = values.rank(method="average", pct=True)
+        present = percentiles.notna()
+        score = percentiles.mean(axis=1, skipna=True).where(present.any(axis=1))
+        models[f"score_{tier}"] = score
+        models[f"used_{tier}"] = present.apply(
+            lambda row: ", ".join(SCORE_LABELS[field] for field in SCORE_FIELDS if row[field]),
+            axis=1,
+        )
+    return models
 
 
 def _prepare_staff() -> pd.DataFrame:
@@ -256,28 +330,25 @@ def load():
     timelines = _prepare_timelines()
     campuses = _prepare_campuses(timelines)
     keep = set(campuses["name"])
-    timelines = timelines.loc[timelines["campus"].isin(keep)].copy()
-    owner = campuses.set_index("name")["owner"]
-    timelines["owner"] = timelines["campus"].map(owner)
-    timelines["color"] = timelines["owner"].where(timelines["owner"].isin(FOCUS_OWNERS), "Other")
+    timelines = timelines.loc[timelines["campus"].isin(keep)]
     models = _prepare_models()
     return {
         "campuses": campuses,
         "timelines": timelines,
-        "monthly": _monthly_matrix(timelines),
+        "monthly": {column: _monthly_matrix(timelines, column) for column in METRIC_COLUMNS},
         "models": models,
-        "revenue": _prepare_revenue(),
         "staff": _prepare_staff(),
     }
 
 
-def _monthly_matrix(timelines: pd.DataFrame) -> pd.DataFrame:
-    """H100e per campus (rows) on the first day of each month (columns), carried forward."""
+def _monthly_matrix(timelines: pd.DataFrame, column: str) -> pd.DataFrame:
+    """One metric per campus (rows) on the first day of each month, carried forward."""
     rows = {}
     for campus, group in timelines.groupby("campus"):
-        series = group.sort_values("date").set_index("date")["h100e"]
+        series = group.sort_values("date").set_index("date")[column]
         series = series[~series.index.duplicated(keep="last")]
-        rows[campus] = series.reindex(series.index.union(MONTHS)).ffill().fillna(0).reindex(MONTHS)
+        filled = series.reindex(series.index.union(MONTHS)).ffill().reindex(MONTHS)
+        rows[campus] = filled.fillna(0)
     return pd.DataFrame(rows).T
 
 
@@ -307,19 +378,18 @@ def attribution(campuses: pd.DataFrame, role: str) -> pd.DataFrame:
         if role == "user":
             users = record["users"]
             if not users:
-                rows.append((record["name"], "Unattributed", 1.0))
+                rows.append((record["name"], "Unknown", 1.0))
                 continue
             for user in users:
-                rows.append((record["name"], user if user in COLORS else "Other", 1.0 / len(users)))
+                rows.append((record["name"], user, 1.0 / len(users)))
         else:
-            owner = record["owner"]
-            rows.append((record["name"], owner if owner in FOCUS_OWNERS else "Other", 1.0))
+            rows.append((record["name"], record["owner"] or "Unknown", 1.0))
     frame = pd.DataFrame(rows, columns=["campus", "company", "share"])
     return frame.groupby(["campus", "company"], as_index=False)["share"].sum()
 
 
 def compute_series(monthly: pd.DataFrame, shares: pd.DataFrame) -> pd.DataFrame:
-    """Monthly H100e by company (columns), indexed by month."""
+    """Monthly metric by company (columns), indexed by month."""
     if shares.empty:
         return pd.DataFrame(index=MONTHS)
     values = monthly.reindex(shares["campus"]).fillna(0).to_numpy() * shares["share"].to_numpy()[:, None]
@@ -330,134 +400,277 @@ def compute_series(monthly: pd.DataFrame, shares: pd.DataFrame) -> pd.DataFrame:
     return series
 
 
-def campus_h100e_at(monthly: pd.DataFrame, names, end) -> pd.Series:
-    month = _month_on_or_before(end)
-    return monthly.reindex(list(names)).fillna(0)[month]
+def _orgs_overlap(orgs: list[str], wanted: set[str]) -> bool:
+    return bool(wanted.intersection(orgs))
 
 
-def _month_on_or_before(value) -> pd.Timestamp:
-    stamp = pd.Timestamp(value) if value else MONTHS[-1]
-    position = MONTHS.searchsorted(stamp, side="right") - 1
-    return MONTHS[max(0, min(position, len(MONTHS) - 1))]
+def _companies_named(names: list[str] | None) -> list[str]:
+    if not names:
+        return []
+    chosen = set(names)
+    return [name for name in company_order() if name in chosen]
 
 
-def frontier(models: pd.DataFrame, companies: list[str]) -> pd.DataFrame:
-    """Models per company with the running max of training compute and a record flag."""
-    pieces = []
-    scoped = models.loc[models["has_compute"]]
-    for company in companies:
-        group = scoped.loc[scoped["orgs"].map(lambda orgs: company in orgs)].sort_values("date").copy()
-        if group.empty:
-            continue
-        group["company"] = company
-        group["best"] = group["compute"].cummax()
-        group["record"] = group["compute"] > group["best"].shift(1).fillna(0)
-        pieces.append(group)
-    if not pieces:
-        return pd.DataFrame(columns=list(scoped.columns) + ["company", "best", "record"])
-    return pd.concat(pieces, ignore_index=True)
+def _filter_models(models: pd.DataFrame, names: list[str] | None, start, end) -> pd.DataFrame:
+    scoped = models
+    if names is not None:
+        wanted = set(names)
+        scoped = scoped.loc[scoped["orgs"].map(lambda orgs: _orgs_overlap(orgs, wanted))]
+    if start and end:
+        lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+    else:
+        lo, hi = MONTHS[0], MONTHS[-1]
+    return scoped.loc[(scoped["date"] >= lo) & (scoped["date"] <= hi)].copy()
+
+
+def _yearly_stats(models: pd.DataFrame, companies: list[str] | None, column: str, stat: str) -> dict:
+    """One row per company, one column per publication year. Missing years stay empty."""
+    frame = models.loc[models[column].notna(), ["orgs", "date", column]].copy()
+    if column != "score":
+        frame = frame.loc[frame[column] > 0]
+    if frame.empty:
+        return {"years": [], "rows": [{"company": name} for name in (companies or [])]}
+    frame = frame.explode("orgs").rename(columns={"orgs": "company", column: "value"})
+    frame = frame.dropna(subset=["company"])
+    if companies is not None:
+        frame = frame.loc[frame["company"].isin(companies)]
+    if frame.empty:
+        return {"years": [], "rows": [{"company": name} for name in companies]}
+    frame["year"] = frame["date"].dt.year.astype(int)
+    grouped = frame.groupby(["company", "year"])["value"].agg(stat)
+    years = [str(year) for year in sorted(grouped.index.get_level_values("year").unique())]
+    if companies is None:
+        present = set(grouped.index.get_level_values("company"))
+        focus = [name for name in company_order() if name in present and name in MODEL_FOCUS]
+        rest = sorted((name for name in present if name not in focus), key=str.lower)
+        names = focus + rest
+    else:
+        names = list(companies)
+    rows = []
+    for name in names:
+        row = {"company": name}
+        for year in years:
+            key = (name, int(year))
+            if key in grouped.index:
+                value = float(grouped.loc[key])
+                row[year] = None if pd.isna(value) else value
+            else:
+                row[year] = None
+        rows.append(row)
+    return {"years": years, "rows": rows}
+
+
+def _weighted_snapshot(campuses: pd.DataFrame, shares: pd.DataFrame) -> pd.DataFrame:
+    metrics = campuses.set_index("name")[["h100e", "snapshot_power_mw", "cost_b"]]
+    frame = shares.merge(metrics, left_on="campus", right_index=True, how="left")
+    for column in ("h100e", "snapshot_power_mw", "cost_b"):
+        frame[column] = frame[column].fillna(0) * frame["share"]
+    return frame
+
+
+def year_end_month(year: int) -> pd.Timestamp:
+    """Last month of a year in the timeline. 2030 only has January."""
+    months = MONTHS[MONTHS.year == int(year)]
+    return months[-1] if len(months) else MONTHS[-1]
+
+
+def _levels(monthly: pd.DataFrame, shares: pd.DataFrame, stamp: pd.Timestamp) -> pd.Series:
+    if shares.empty or stamp not in monthly.columns:
+        return pd.Series(0.0, index=shares.index)
+    values = monthly[stamp].reindex(shares["campus"]).fillna(0).to_numpy() * shares["share"].to_numpy()
+    return pd.Series(values, index=shares.index)
+
+
+def share_segments(monthly: pd.DataFrame, shares: pd.DataFrame, stamp: pd.Timestamp, kind: str) -> list[dict]:
+    levels = _levels(monthly, shares, stamp)
+    if levels.empty:
+        return []
+    frame = shares[["campus", "company"]].copy()
+    frame["level"] = levels.reindex(frame.index).fillna(0).to_numpy()
+    if kind == "campus":
+        grouped = frame.groupby(["company", "campus"], as_index=False)["level"].sum()
+    else:
+        grouped = frame.groupby("company", as_index=False)["level"].sum()
+    grouped = grouped.loc[grouped["level"] > 0].sort_values("level", ascending=False)
+    return [
+        {
+            "label": str(row.campus if kind == "campus" else row.company),
+            "company": str(row.company),
+            "value": float(row.level),
+        }
+        for row in grouped.itertuples(index=False)
+    ]
+
+
+def _year_company_rows(data: dict, shares: pd.DataFrame, stamp: pd.Timestamp, names: list[str]) -> list[dict]:
+    h100 = _levels(data["monthly"]["h100e"], shares, stamp)
+    power = _levels(data["monthly"]["power_mw"], shares, stamp)
+    cost = _levels(data["monthly"]["cost_b"], shares, stamp)
+    counts = shares.groupby("company")["campus"].nunique()
+    rows = []
+    for name in names:
+        mask = shares["company"].to_numpy() == name
+        rows.append({
+            "company": name,
+            "campuses": int(counts.at[name]) if name in counts.index else 0,
+            "h100e": float(h100[mask].sum()) if mask.any() else 0.0,
+            "power_mw": float(power[mask].sum()) if mask.any() else 0.0,
+            "cost_b": float(cost[mask].sum()) if mask.any() else 0.0,
+        })
+    return rows
 
 
 def view_state(selection: dict | None) -> dict:
-    """Apply company, campus, role, chip, status, and date filters shared by every view."""
+    """Turn the shared selection into the frames each view draws.
+
+    No companies selected means the same as every focus company: the current
+    scope is shown in full. All nine, every organization: campuses and models
+    stay unfiltered. A smaller set: the bar and the model tables keep those
+    companies. On the focus time series the other companies stay in the frame
+    and are dimmed through ``highlight``.
+    """
     data = load()
     selection = selection or {}
-    companies = [name for name in (selection.get("companies") or []) if name in COLORS]
-    campus = selection.get("campus") or None
-    start = selection.get("date_start") or None
-    end = selection.get("date_end") or None
+    focus_names = company_order()
+    scope = selection.get("model_scope") or "focus"
+    if scope not in ("focus", "all"):
+        scope = "focus"
+    picks = [name for name in (selection.get("companies") or []) if name in focus_names]
     role = selection.get("role") or "owner"
     chips = [family for family in (selection.get("chips") or []) if family in CHIP_PATTERNS]
-    status = selection.get("status") or "all"
+    metric = selection.get("capacity_metric") or "h100e"
+    if metric not in METRIC_COLUMNS:
+        metric = "h100e"
 
     base = data["campuses"]
     if chips:
         base = base.loc[base["chip_family"].isin(chips)]
-    if status != "all":
-        base = base.loc[base["status"] == status]
-    campuses = campuses_for_companies(base, companies, role).copy()
-
-    shares = attribution(campuses, role)
-    if companies:
-        shares = shares.loc[shares["company"].isin(companies)]
-    series = compute_series(data["monthly"], shares)
-
-    at_end = campus_h100e_at(data["monthly"], campuses["name"], end)
-    campuses["h100e_end"] = campuses["name"].map(at_end).fillna(0)
-    share_at_end = shares.assign(value=shares["campus"].map(at_end).fillna(0) * shares["share"])
-
-    summary = []
-    for name in companies:
-        own = campuses.loc[campuses_for_companies(campuses, [name], role).index]
-        summary.append(
-            {
-                "company": name,
-                "campuses": int((own["h100e_end"] > 0).sum()),
-                "h100e": float(share_at_end.loc[share_at_end["company"] == name, "value"].sum()),
-                "cost_b": float(own["cost_b"].sum()),
-            }
-        )
+    scope_names = list(focus_names) if scope == "focus" else []
+    scope_campuses = campuses_for_companies(base, scope_names, role).copy()
+    scope_shares = attribution(scope_campuses, role)
+    if scope == "focus":
+        scope_shares = scope_shares.loc[scope_shares["company"].isin(focus_names)]
+    picked_all = not picks or set(picks) == set(focus_names)
+    if scope == "all" and picked_all:
+        bar_shares = scope_shares
+        series_shares = scope_shares
+        highlight = []
+        drilled = False
+        org_names = None
+        table_names = None
+    elif scope == "focus" and picked_all:
+        bar_shares = scope_shares
+        series_shares = scope_shares
+        highlight = []
+        drilled = False
+        org_names = list(focus_names)
+        table_names = _companies_named(org_names)
+    else:
+        bar_shares = scope_shares.loc[scope_shares["company"].isin(picks)]
+        if scope == "focus":
+            series_shares = scope_shares
+            highlight = picks
+        else:
+            series_shares = bar_shares
+            highlight = []
+        drilled = True
+        org_names = list(picks)
+        table_names = _companies_named(org_names)
+    series = compute_series(data["monthly"][metric], series_shares)
+    weighted = _weighted_snapshot(scope_campuses, bar_shares)
+    visible = scope_campuses.loc[scope_campuses["name"].isin(set(bar_shares["campus"]))]
 
     chip_summary = []
     for family in chips:
-        own = campuses.loc[campuses["chip_family"] == family]
+        own_names = set(scope_campuses.loc[scope_campuses["chip_family"] == family, "name"])
+        part = weighted.loc[weighted["campus"].isin(own_names)]
         chip_summary.append(
             {
                 "chip": family,
-                "campuses": int((own["h100e_end"] > 0).sum()),
-                "h100e": float(share_at_end.loc[share_at_end["campus"].isin(own["name"]), "value"].sum()),
-                "cost_b": float(own["cost_b"].sum()),
+                "campuses": int(part["campus"].nunique()),
+                "h100e": float(part["h100e"].sum()),
+                "cost_b": float(part["cost_b"].sum()),
             }
         )
 
-    campus_series = None
-    if campus and campus in data["monthly"].index:
-        campus_series = data["monthly"].loc[campus]
+    tier = selection.get("model_tier") or "all"
+    if tier not in MODEL_TIERS:
+        tier = "all"
+    raw_metric = selection.get("raw_metric") or "compute"
+    if raw_metric not in RAW_METRICS:
+        raw_metric = "compute"
+    model_stat = selection.get("model_stat") or selection.get("score_stat") or "max"
+    if model_stat not in STATS:
+        model_stat = "max"
 
-    model_companies = selection.get("model_companies") or None
-    if model_companies:
-        frontier_companies = list(model_companies)
-    elif companies:
-        frontier_companies = companies
+    catalog = data["models"]
+    if tier == "notable":
+        pool = catalog.loc[catalog["notable"]].copy()
+    elif tier == "frontier":
+        pool = catalog.loc[catalog["frontier"]].copy()
     else:
-        frontier_companies = FOCUS_OWNERS + LABS
-    models = frontier(data["models"], frontier_companies)
-    in_window = models
-    if start and end:
-        in_window = models.loc[(models["date"] >= pd.Timestamp(start)) & (models["date"] <= pd.Timestamp(end))]
+        pool = catalog
+    scored = pool.dropna(subset=[f"score_{tier}"]).copy()
+    scored["score"] = scored[f"score_{tier}"]
+    scored["used"] = scored[f"used_{tier}"]
+    ranked = _filter_models(scored, org_names, None, None)
+    rank_summary = _yearly_stats(ranked, table_names, "score", model_stat)
 
+    frontier_pool = catalog.loc[catalog["frontier"]].copy()
+    measured = _filter_models(frontier_pool, org_names, None, None)
+    raw = measured.loc[measured[raw_metric] > 0].copy()
+    raw["value"] = raw[raw_metric]
+    raw_summary = _yearly_stats(measured, table_names, raw_metric, model_stat)
+
+    model_years = [] if ranked.empty else sorted(int(year) for year in ranked["date"].dt.year.unique())
+    requested = selection.get("model_year")
+    try:
+        requested = int(requested) if requested is not None else None
+    except (TypeError, ValueError):
+        requested = None
+    model_year = requested if requested is not None and 2018 <= requested <= 2030 else (
+        model_years[-1] if model_years else 2026
+    )
+    if model_year not in model_years:
+        ranked_year = ranked.iloc[0:0]
+        raw_year = raw.iloc[0:0]
+    else:
+        ranked_year = ranked.loc[ranked["date"].dt.year == model_year]
+        raw_year = raw.loc[raw["date"].dt.year == model_year]
+
+    stamp = year_end_month(model_year)
+    kind = "campus" if drilled else "company"
+    summary = _year_company_rows(data, bar_shares, stamp, picks) if drilled and len(picks) <= 3 else []
     return {
-        "companies": companies,
+        "companies": picks,
+        "scope": scope,
         "summary": summary,
+        "segments": share_segments(data["monthly"][metric], bar_shares, stamp, kind),
+        "segment_kind": kind,
+        "highlight": highlight,
         "chip_summary": chip_summary,
-        "campus": campus,
         "role": role,
         "chips": chips,
-        "status": status,
-        "date_start": start,
-        "date_end": end,
-        "end_month": _month_on_or_before(end),
-        "campuses": campuses,
-        "shares": shares,
+        "campuses": visible,
+        "shares": scope_shares,
         "series": series,
-        "campus_series": campus_series,
-        "h100e_end": float(share_at_end["value"].sum()),
-        "models": models,
-        "models_in_window": in_window,
-        "revenue": data["revenue"],
+        "capacity_metric": metric,
+        "h100e_now": float(weighted["h100e"].sum()) if not weighted.empty else 0.0,
+        "model_tier": tier,
+        "model_scope": scope,
+        "raw_metric": raw_metric,
+        "model_stat": model_stat,
+        "model_year": model_year,
+        "model_years": model_years,
+        "org_names": org_names,
+        "ranked": ranked,
+        "ranked_year": ranked_year,
+        "rank_summary": rank_summary,
+        "raw": raw,
+        "raw_year": raw_year,
+        "raw_summary": raw_summary,
         "staff": data["staff"],
     }
-
-
-def quarter_date(index: int) -> str:
-    return QUARTERS[max(0, min(int(index), len(QUARTERS) - 1))].date().isoformat()
-
-
-def quarter_index(value, round_up: bool = False) -> int:
-    stamp = pd.Timestamp(value)
-    side = "left" if round_up else "right"
-    position = QUARTERS.searchsorted(stamp, side=side) - (0 if round_up else 1)
-    return max(0, min(int(position), len(QUARTERS) - 1))
 
 
 def format_h100(value: float) -> str:
@@ -468,21 +681,3 @@ def format_h100(value: float) -> str:
     if abs(value) >= 1_000:
         return f"{value / 1_000:.0f}k"
     return f"{value:.0f}"
-
-
-def parse_bound(value) -> date | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        return datetime.utcfromtimestamp(value / 1000).date()
-    text = str(value).strip()
-    if not text or text.lower() == "none":
-        return None
-    head = text[:10]
-    try:
-        return datetime.strptime(head, "%Y-%m-%d").date()
-    except ValueError:
-        parsed = pd.to_datetime(text, errors="coerce")
-        if pd.isna(parsed):
-            return None
-        return parsed.date()
